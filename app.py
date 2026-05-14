@@ -7,7 +7,9 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 
+# -------------------------------
 # PAGE CONFIG
+# -------------------------------
 st.set_page_config(
     page_title="AI Onboarding Chatbot",
     page_icon="🤖",
@@ -62,7 +64,7 @@ def split_text(all_text):
 
 
 # -------------------------------
-# CREATE VECTOR STORE
+# VECTOR STORE
 # -------------------------------
 faiss_index_path = "faiss_index"
 
@@ -102,7 +104,7 @@ def create_vector_store(chunks):
 @st.cache_resource
 def load_llm():
 
-    # LOCAL PC
+    # LOCAL SYSTEM
     groq_api_key = os.getenv("GROQ_API_KEY")
 
     # STREAMLIT CLOUD
@@ -123,6 +125,11 @@ def load_llm():
 # -------------------------------
 all_text = load_pdf_text(pdf_folder)
 
+# HANDLE EMPTY PDF CONTENT
+if not all_text:
+    st.error("No PDF content found.")
+    st.stop()
+
 chunks = split_text(all_text)
 
 vector_store = create_vector_store(chunks)
@@ -133,7 +140,10 @@ llm = load_llm()
 # -------------------------------
 # USER INPUT
 # -------------------------------
-question = st.text_input("Ask Your Question")
+question = st.text_input(
+    "Ask Your Question",
+    placeholder="Example: What is today's lunch menu?"
+)
 
 
 # -------------------------------
@@ -141,19 +151,40 @@ question = st.text_input("Ask Your Question")
 # -------------------------------
 if question:
 
-    # LOWERCASE SEARCH
+    # CLEAN QUESTION
     question = question.lower().strip()
 
-    # VECTOR SEARCH
-    docs = vector_store.similarity_search(
+    # VECTOR SEARCH WITH SCORES
+    docs = vector_store.similarity_search_with_score(
         question,
         k=8
     )
 
+    # FILTER RELEVANT DOCS
+    filtered_docs = []
+
+    for doc, score in docs:
+
+        if score < 1.5:
+            filtered_docs.append(doc)
+
     # CREATE CONTEXT
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join(
+        [doc.page_content for doc in filtered_docs]
+    )
 
     context = context[:5000]
+
+    # NO MATCH FOUND
+    if not context.strip():
+
+        st.subheader("AI Answer")
+
+        st.write(
+            "I could not find that information in the documents."
+        )
+
+        st.stop()
 
     # PROMPT
     prompt = f"""
@@ -177,7 +208,9 @@ Question:
 """
 
     # LLM RESPONSE
-    response = llm.invoke(prompt)
+    with st.spinner("Thinking..."):
+
+        response = llm.invoke(prompt)
 
     # OUTPUT
     st.subheader("AI Answer")

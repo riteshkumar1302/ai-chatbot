@@ -1,11 +1,10 @@
 streamlit
 pypdf
-langchain
-langchain-community
+langchain==0.2.17
+langchain-community==0.2.17
 langchain-text-splitters
 langchain-groq
 faiss-cpu
 sentence-transformers
 huggingface-hub
-torch
 numpy<2
