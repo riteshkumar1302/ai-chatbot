@@ -1,11 +1,14 @@
+from rank_bm25 import BM25Okapi
 import streamlit as st
 from pypdf import PdfReader
 import os
+import re
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
+from sentence_transformers import CrossEncoder
 
 # -------------------------------
 # PAGE CONFIG
@@ -18,7 +21,70 @@ st.set_page_config(
 
 st.title("🤖 Hello Persistonaut")
 
+st.markdown(
+    """
+    <style>
+    [data-testid="stAppViewContainer"] > .main .block-container {
+        max-width: 900px;
+        padding-top: 16vh;
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    h1 {
+        text-align: center;
+    }
+
+    .kiwi-label {
+        font-family: Arial, Helvetica, sans-serif;
+        color: #f5f5f5;
+        font-size: 21px;
+        font-weight: 700;
+        line-height: 1.2;
+        margin: 0 auto 14px auto;
+        max-width: 1000px;
+        text-align: center;
+    }
+
+    .kiwi-brand {
+        color: #ff4b4b;
+        font-family: Impact, "Arial Black", "Trebuchet MS", sans-serif;
+        font-size: 24px;
+        font-weight: 900;
+        letter-spacing: 0;
+    }
+
+    [data-testid="stTextInput"] {
+        width: min(760px, 92vw);
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    [data-testid="stTextInput"] > div {
+        width: 100%;
+    }
+
+    [data-testid="stTextInput"] input {
+        text-align: center;
+    }
+
+    [data-testid="stTextInput"] label {
+        justify-content: center;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 pdf_folder = "pdfs"
+
+# -------------------------------
+# CONVERSATION MEMORY
+# -------------------------------
+if "last_question" not in st.session_state:
+    st.session_state.last_question = ""
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
 
 # -------------------------------
 # LOAD PDF TEXT
@@ -70,6 +136,7 @@ def split_text(all_text):
 # VECTOR STORE
 # -------------------------------
 faiss_index_path = "faiss_index"
+reranker_model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
 @st.cache_resource
@@ -130,6 +197,35 @@ def load_llm():
     return llm
 
 
+@st.cache_resource
+def load_reranker():
+
+    return CrossEncoder(reranker_model_name)
+
+
+def rerank_chunks(question, candidate_chunks, top_k=3):
+
+    if not candidate_chunks:
+        return []
+
+    reranker = load_reranker()
+
+    pairs = [
+        (question, chunk)
+        for chunk in candidate_chunks
+    ]
+
+    scores = reranker.predict(pairs)
+
+    ranked_chunks = sorted(
+        zip(candidate_chunks, scores),
+        key=lambda item: float(item[1]),
+        reverse=True
+    )
+
+    return ranked_chunks[:top_k]
+
+
 # -------------------------------
 # LOAD EVERYTHING
 # -------------------------------
@@ -146,15 +242,96 @@ chunks = split_text(all_text)
 
 vector_store = create_vector_store(chunks)
 
+# -------------------------------
+# BM25 INDEX
+# -------------------------------
+tokenized_chunks = [
+    chunk.lower().split()
+    for chunk in chunks
+]
+
+bm25 = BM25Okapi(tokenized_chunks)
+
 llm = load_llm()
 
+# -------------------------------
+# CLEAN CONTEXT FOR LLM
+# -------------------------------
+def clean_context_for_llm(context):
+
+    remove_patterns = [
+        "QUICK REFERENCE",
+        "RELATED TOPICS",
+        "END OF RELATED TOPICS",
+        "To find information about",
+        "See Section"
+    ]
+
+    cleaned_lines = []
+
+    for line in context.split("\n"):
+
+        skip = False
+
+        for pattern in remove_patterns:
+
+            if pattern.lower() in line.lower():
+                skip = True
+                break
+
+        if not skip:
+            cleaned_lines.append(line)
+
+    cleaned_context = "\n".join(cleaned_lines)
+
+    return cleaned_context
+
+
+def clean_answer_for_user(answer):
+
+    answer = re.sub(
+        r"\bconfidential\b",
+        "restricted",
+        answer,
+        flags=re.IGNORECASE
+    )
+
+    remove_patterns = [
+        "QUICK REFERENCE",
+        "RELATED TOPICS",
+        "END OF RELATED TOPICS",
+        "To find information about",
+        "See Section",
+        "refer to section",
+        "more details"
+    ]
+
+    cleaned_lines = []
+
+    for line in answer.split("\n"):
+
+        if any(pattern.lower() in line.lower() for pattern in remove_patterns):
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned_answer = "\n".join(cleaned_lines).strip()
+
+    return cleaned_answer or "Please reach out to your HR for this query"
 
 # -------------------------------
 # USER INPUT
 # -------------------------------
+st.markdown(
+    '<div class="kiwi-label">I\'m <span class="kiwi-brand">KIWI-8</span>, How can I help you today</div>',
+    unsafe_allow_html=True
+)
+
 question = st.text_input(
-    "I'm KIWI8, Ask Your HR Questions",
-    placeholder="Ask you HR related questions about holidays, policies, benefits, onboarding, and more..."
+    "I'm KIWI-8, How can I help you today?",
+    placeholder="Ask your HR related questions "
+    ,
+    label_visibility="collapsed"
 )
 
 
@@ -162,6 +339,20 @@ question = st.text_input(
 # QUESTION ANSWERING
 # -------------------------------
 if question:
+
+    original_question = question
+
+    # ========== HANDLE FOLLOW-UP QUERIES ==========
+    follow_up_phrases = ["give me", "whole", "complete", "correct", "full", "detailed", "in detail", "tell me more", "elaborate"]
+    
+    is_follow_up = any(phrase in question.lower() for phrase in follow_up_phrases)
+    
+    if is_follow_up and st.session_state.last_question:
+        # User wants more details about previous question
+        original_question = st.session_state.last_question
+        question = original_question
+        st.info(f"📌 Getting complete details about: {original_question}")
+    # ==============================================
 
     # -------------------------------
     # STOP WORDS
@@ -171,15 +362,28 @@ if question:
         "a", "an", "please", "can", "i",
         "show", "tell", "me", "about",
         "in", "for", "of", "Please", "Can", "I", "Show", "Tell", "Me", "About",
-        "In", "For", "Of", "help"
+        "In", "For", "Of", "help", 
     }
 
     # -------------------------------
     # CLEAN QUESTION
     # -------------------------------
+    ignore_phrases = [
+        "tell me in detail",
+        "explain in detail",
+        "give me details",
+        "tell me more",
+        "please explain",
+        "please provide details",
+        "in detail"
+    ]
+
+    question = question.lower()
+    for phrase in ignore_phrases:
+        question = question.replace(phrase, "")
+
     question = (
-        question.lower()
-        .replace("?", "")
+        question.replace("?", "")
         .replace(",", "")
         .strip()
     )
@@ -195,6 +399,23 @@ if question:
     ]
 
     clean_question = " ".join(filtered_words)
+
+    # ========== QUERY EXPANSION ==========
+    intent_map = {
+        "quit": ["resign", "resignation", "separation", "notice period", "full and final"],
+        "masters": ["mtech", "m.tech", "higher education", "post graduate"],
+        "mba": ["master of business administration"],
+        "bonus": ["annual performance bonus", "apb", "incentive"],
+        "insurance": ["mediclaim", "health insurance", "hospitalization"],
+        "refer": ["referral", "employee referral", "referral bonus"],
+    }
+    
+    original_lower = original_question.lower()
+    for intent, keywords in intent_map.items():
+        if intent in original_lower:
+            clean_question += " " + " ".join(keywords)
+            break
+    # ========== END OF QUERY EXPANSION ==========
 
     # -------------------------------
     # KEYWORD SEARCH
@@ -215,6 +436,10 @@ if question:
 
             if word in chunk_lower:
                 match_score += 1
+
+        # BOOST FOR RELEVANT SECTIONS
+        if any(term in chunk_lower for term in ["resignation", "notice period", "separation", "full and final", "mtech", "mba", "higher education"]):
+            match_score += 5
 
         # HEADING BOOST
         if clean_question in chunk_lower:
@@ -250,32 +475,62 @@ if question:
     )
 
     # -------------------------------
-    # CREATE CONTEXT
+    # COLLECT RETRIEVAL CANDIDATES
     # -------------------------------
-    if matched_chunks:
+    candidate_chunks = []
+    seen_chunks = set()
 
-        context = "\n\n".join(
-            [chunk for chunk, score in matched_chunks[:3]]
-        )
+    def add_candidate(chunk):
+
+        if chunk not in seen_chunks:
+            candidate_chunks.append(chunk)
+            seen_chunks.add(chunk)
+
+    for chunk, score in matched_chunks[:5]:
+        add_candidate(chunk)
+
+    query_tokens = clean_question.split()
+    bm25_scores = bm25.get_scores(query_tokens)
+
+    ranked_indices = sorted(
+        range(len(bm25_scores)),
+        key=lambda i: bm25_scores[i],
+        reverse=True
+    )[:5]
+
+    for index in ranked_indices:
+
+        if bm25_scores[index] > 0:
+            add_candidate(chunks[index])
+
+    docs = vector_store.similarity_search(
+        clean_question,
+        k=5
+    )
+
+    for doc in docs:
+        add_candidate(doc.page_content)
 
     # -------------------------------
-    # FALLBACK TO FAISS SEARCH
+    # RERANK CANDIDATES BY FULL QUESTION
     # -------------------------------
-    else:
+    reranked_chunks = rerank_chunks(
+        original_question,
+        candidate_chunks,
+        top_k=2
+    )
 
-        docs = vector_store.similarity_search(
-            clean_question,
-            k=3
-        )
-
-        context = "\n\n".join(
-            [doc.page_content for doc in docs]
-        )
+    context = "\n\n".join(
+        [chunk for chunk, score in reranked_chunks]
+    )
 
     # -------------------------------
     # LIMIT CONTEXT
     # -------------------------------
-    context = context[:5000]
+    context = context[:2000]
+
+    # REMOVE NAVIGATION REFERENCES
+    context = clean_context_for_llm(context)
 
     # -------------------------------
     # NO MATCH FOUND
@@ -285,7 +540,7 @@ if question:
         st.subheader("AI Answer")
 
         st.write(
-            "I could not find that information in the documents."
+            "Please reach out to your HR for this query"
         )
 
         st.stop()
@@ -300,12 +555,18 @@ Rules:
 - Answer ONLY from the provided context.
 - Understand similar wording and user intent.
 - Prioritize headings and matching keywords.
-- Provide only the most relevant answer, limiting to 1-3 key points or items.
+- Provide relevant answer with key points (use bullet points for multiple items).
 - Keep answers clean, readable, and properly formatted.
 - Put every list item on a NEW LINE.
 - Never merge multiple items into one paragraph.
 - Use bullet points whenever possible.
 - Preserve section headings.
+- Ignore QUICK REFERENCE sections.
+- Ignore RELATED TOPICS sections.
+- Ignore "See Section" references.
+- Do NOT include navigation references in final answer.
+- Give direct answer only.
+- Do not use the word "confidential"; use "restricted" or "internal" instead.
 - Do NOT make up information.
 - If answer is not found, say:
 "I could not find that information in the documents."
@@ -314,7 +575,7 @@ Context:
 {context}
 
 Question:
-{clean_question}
+{original_question}
 
 IMPORTANT RESPONSE FORMAT:
 
@@ -342,6 +603,11 @@ Always keep each item on a separate line.
     # -------------------------------
     # OUTPUT
     # -------------------------------
-    st.subheader("AI Answer")
+    st.subheader("Here is your answer")
 
-    st.write(response.content)
+    st.write(clean_answer_for_user(response.content))
+    
+    # ========== SAVE TO MEMORY ==========
+    st.session_state.last_question = original_question
+    st.session_state.last_answer = response.content
+    # ===================================

@@ -3,3 +3,6 @@ faiss_index/
 .cache/
 __pycache__/
 .env
+venv/
+*.pyc
+app.py.bak
