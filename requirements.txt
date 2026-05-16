@@ -1,5 +1,6 @@
 streamlit
 pypdf
+python-dotenv
 langchain-text-splitters
 langchain-community
 langchain-groq

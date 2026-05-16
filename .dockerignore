@@ -1,0 +1,13 @@
+.git
+.gitignore
+.streamlit/secrets.toml
+.cache/
+faiss_index/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+app.py.bak

@@ -1,25 +1,17 @@
-from rank_bm25 import BM25Okapi
 import streamlit as st
-from pypdf import PdfReader
-import os
-import re
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
-from sentence_transformers import CrossEncoder
+from chatbot.config import get_groq_api_key, load_settings
+from chatbot.documents import load_pdf_text, split_text
+from chatbot.llm import build_prompt, clean_answer_for_user, load_llm
+from chatbot.retrieval import HybridRetriever
 
-# -------------------------------
-# PAGE CONFIG
-# -------------------------------
+
 st.set_page_config(
     page_title="AI Onboarding Chatbot",
-    page_icon="🤖",
-    layout="wide"
+    layout="wide",
 )
 
-st.title("🤖 Hello Persistonaut")
+st.title("Hello Persistonaut")
 
 st.markdown(
     """
@@ -73,541 +65,107 @@ st.markdown(
     }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
-pdf_folder = "pdfs"
 
-# -------------------------------
-# CONVERSATION MEMORY
-# -------------------------------
+settings = load_settings()
+
+
+@st.cache_data(show_spinner="Reading PDF documents...")
+def cached_pdf_text(pdf_folder: str) -> str:
+    return load_pdf_text(pdf_folder)
+
+
+@st.cache_data(show_spinner="Preparing document chunks...")
+def cached_chunks(all_text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    return split_text(all_text, chunk_size, chunk_overlap)
+
+
+@st.cache_resource(show_spinner="Building retrieval index...")
+def cached_retriever(chunks_tuple: tuple[str, ...], settings_snapshot) -> HybridRetriever:
+    return HybridRetriever.from_chunks(list(chunks_tuple), settings_snapshot)
+
+
+@st.cache_resource(show_spinner="Connecting to language model...")
+def cached_llm(groq_api_key: str, model_name: str):
+    return load_llm(groq_api_key, model_name)
+
+
+def resolve_follow_up_question(question: str) -> str:
+    follow_up_phrases = {
+        "complete",
+        "correct",
+        "detailed",
+        "elaborate",
+        "full",
+        "give me",
+        "in detail",
+        "tell me more",
+        "whole",
+    }
+
+    if (
+        any(phrase in question.lower() for phrase in follow_up_phrases)
+        and st.session_state.last_question
+    ):
+        st.info(f"Getting complete details about: {st.session_state.last_question}")
+        return st.session_state.last_question
+
+    return question
+
+
 if "last_question" not in st.session_state:
     st.session_state.last_question = ""
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = ""
 
-# -------------------------------
-# LOAD PDF TEXT
-# -------------------------------
-@st.cache_data
-def load_pdf_text(pdf_folder):
 
-    all_text = ""
-
-    if not os.path.exists(pdf_folder):
-        return ""
-
-    for file in os.listdir(pdf_folder):
-
-        if file.endswith(".pdf"):
-
-            pdf_path = os.path.join(pdf_folder, file)
-
-            reader = PdfReader(pdf_path)
-
-            for page in reader.pages:
-
-                text = page.extract_text()
-
-                if text:
-                    all_text += text + "\n"
-
-    return all_text
-
-
-# -------------------------------
-# SPLIT TEXT INTO CHUNKS
-# -------------------------------
-@st.cache_data
-def split_text(all_text):
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=700,
-        chunk_overlap=150,
-        separators=["\n\n", "\n", ".", " "]
-    )
-
-    chunks = text_splitter.split_text(all_text)
-
-    return chunks
-
-
-# -------------------------------
-# VECTOR STORE
-# -------------------------------
-faiss_index_path = "faiss_index"
-reranker_model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-
-@st.cache_resource
-def create_vector_store(chunks):
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        cache_folder=".cache/embeddings",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True}
-    )
-
-    # LOAD EXISTING INDEX
-    if os.path.exists(faiss_index_path):
-
-        vector_store = FAISS.load_local(
-            faiss_index_path,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-
-    # CREATE NEW INDEX
-    else:
-
-        vector_store = FAISS.from_texts(chunks, embeddings)
-
-        vector_store.save_local(faiss_index_path)
-
-    return vector_store
-
-
-# -------------------------------
-# LOAD LLM
-# -------------------------------
-@st.cache_resource
-def load_llm():
-
-    # LOCAL SYSTEM
-    groq_api_key = os.getenv("GROQ_API_KEY")
-
-    # STREAMLIT CLOUD
-    if not groq_api_key:
-        groq_api_key = st.secrets["GROQ_API_KEY"]
-
-    # CHECK API
-    if not groq_api_key:
-
-        st.error("Groq API key not found.")
-
-        st.stop()
-
-    llm = ChatGroq(
-        groq_api_key=groq_api_key,
-        model_name="llama-3.1-8b-instant",
-        temperature=0
-    )
-
-    return llm
-
-
-@st.cache_resource
-def load_reranker():
-
-    return CrossEncoder(reranker_model_name)
-
-
-def rerank_chunks(question, candidate_chunks, top_k=3):
-
-    if not candidate_chunks:
-        return []
-
-    reranker = load_reranker()
-
-    pairs = [
-        (question, chunk)
-        for chunk in candidate_chunks
-    ]
-
-    scores = reranker.predict(pairs)
-
-    ranked_chunks = sorted(
-        zip(candidate_chunks, scores),
-        key=lambda item: float(item[1]),
-        reverse=True
-    )
-
-    return ranked_chunks[:top_k]
-
-
-# -------------------------------
-# LOAD EVERYTHING
-# -------------------------------
-all_text = load_pdf_text(pdf_folder)
-
-# HANDLE EMPTY PDF
+all_text = cached_pdf_text(settings.pdf_folder)
 if not all_text:
-
-    st.error("No PDF content found.")
-
+    st.error(f"No PDF content found in '{settings.pdf_folder}'.")
     st.stop()
 
-chunks = split_text(all_text)
+chunks = cached_chunks(all_text, settings.chunk_size, settings.chunk_overlap)
+if not chunks:
+    st.error("PDF content was found, but no searchable text chunks could be created.")
+    st.stop()
 
-vector_store = create_vector_store(chunks)
+groq_api_key = get_groq_api_key(st.secrets)
+if not groq_api_key:
+    st.error("Groq API key not found. Set GROQ_API_KEY as an environment variable.")
+    st.stop()
 
-# -------------------------------
-# BM25 INDEX
-# -------------------------------
-tokenized_chunks = [
-    chunk.lower().split()
-    for chunk in chunks
-]
+retriever = cached_retriever(tuple(chunks), settings)
+llm = cached_llm(groq_api_key, settings.groq_model_name)
 
-bm25 = BM25Okapi(tokenized_chunks)
-
-llm = load_llm()
-
-# -------------------------------
-# CLEAN CONTEXT FOR LLM
-# -------------------------------
-def clean_context_for_llm(context):
-
-    remove_patterns = [
-        "QUICK REFERENCE",
-        "RELATED TOPICS",
-        "END OF RELATED TOPICS",
-        "To find information about",
-        "See Section"
-    ]
-
-    cleaned_lines = []
-
-    for line in context.split("\n"):
-
-        skip = False
-
-        for pattern in remove_patterns:
-
-            if pattern.lower() in line.lower():
-                skip = True
-                break
-
-        if not skip:
-            cleaned_lines.append(line)
-
-    cleaned_context = "\n".join(cleaned_lines)
-
-    return cleaned_context
-
-
-def clean_answer_for_user(answer):
-
-    answer = re.sub(
-        r"\bconfidential\b",
-        "restricted",
-        answer,
-        flags=re.IGNORECASE
-    )
-
-    remove_patterns = [
-        "QUICK REFERENCE",
-        "RELATED TOPICS",
-        "END OF RELATED TOPICS",
-        "To find information about",
-        "See Section",
-        "refer to section",
-        "more details"
-    ]
-
-    cleaned_lines = []
-
-    for line in answer.split("\n"):
-
-        if any(pattern.lower() in line.lower() for pattern in remove_patterns):
-            continue
-
-        cleaned_lines.append(line)
-
-    cleaned_answer = "\n".join(cleaned_lines).strip()
-
-    return cleaned_answer or "Please reach out to your HR for this query"
-
-# -------------------------------
-# USER INPUT
-# -------------------------------
 st.markdown(
-    '<div class="kiwi-label">I\'m <span class="kiwi-brand">KIWI-8</span>, How can I help you today</div>',
-    unsafe_allow_html=True
+    '<div class="kiwi-label">I\'m <span class="kiwi-brand">KIWI-8</span>, How can I help you today?</div>',
+    unsafe_allow_html=True,
 )
 
 question = st.text_input(
     "I'm KIWI-8, How can I help you today?",
-    placeholder="Ask your HR related questions "
-    ,
-    label_visibility="collapsed"
+    placeholder="Ask your HR related questions",
+    label_visibility="collapsed",
 )
 
-
-# -------------------------------
-# QUESTION ANSWERING
-# -------------------------------
 if question:
+    original_question = resolve_follow_up_question(question)
+    context = retriever.retrieve_context(original_question)
 
-    original_question = question
-
-    # ========== HANDLE FOLLOW-UP QUERIES ==========
-    follow_up_phrases = ["give me", "whole", "complete", "correct", "full", "detailed", "in detail", "tell me more", "elaborate"]
-    
-    is_follow_up = any(phrase in question.lower() for phrase in follow_up_phrases)
-    
-    if is_follow_up and st.session_state.last_question:
-        # User wants more details about previous question
-        original_question = st.session_state.last_question
-        question = original_question
-        st.info(f"📌 Getting complete details about: {original_question}")
-    # ==============================================
-
-    # -------------------------------
-    # STOP WORDS
-    # -------------------------------
-    stop_words = {
-        "how", "to", "what", "is", "the",
-        "a", "an", "please", "can", "i",
-        "show", "tell", "me", "about",
-        "in", "for", "of", "Please", "Can", "I", "Show", "Tell", "Me", "About",
-        "In", "For", "Of", "help", 
-    }
-
-    # -------------------------------
-    # CLEAN QUESTION
-    # -------------------------------
-    ignore_phrases = [
-        "tell me in detail",
-        "explain in detail",
-        "give me details",
-        "tell me more",
-        "please explain",
-        "please provide details",
-        "in detail"
-    ]
-
-    question = question.lower()
-    for phrase in ignore_phrases:
-        question = question.replace(phrase, "")
-
-    question = (
-        question.replace("?", "")
-        .replace(",", "")
-        .strip()
-    )
-
-    # -------------------------------
-    # REMOVE STOP WORDS
-    # -------------------------------
-    words = question.split()
-
-    filtered_words = [
-        word for word in words
-        if word not in stop_words
-    ]
-
-    clean_question = " ".join(filtered_words)
-
-    # ========== QUERY EXPANSION ==========
-    intent_map = {
-        "quit": ["resign", "resignation", "separation", "notice period", "full and final"],
-        "masters": ["mtech", "m.tech", "higher education", "post graduate"],
-        "mba": ["master of business administration"],
-        "bonus": ["annual performance bonus", "apb", "incentive"],
-        "insurance": ["mediclaim", "health insurance", "hospitalization"],
-        "refer": ["referral", "employee referral", "referral bonus"],
-    }
-    
-    original_lower = original_question.lower()
-    for intent, keywords in intent_map.items():
-        if intent in original_lower:
-            clean_question += " " + " ".join(keywords)
-            break
-    # ========== END OF QUERY EXPANSION ==========
-
-    # -------------------------------
-    # KEYWORD SEARCH
-    # -------------------------------
-    matched_chunks = []
-
-    for chunk in chunks:
-
-        chunk_lower = chunk.lower()
-
-        match_score = 0
-
-        # MATCH WORDS
-        for word in filtered_words:
-
-            if len(word) <= 2:
-                continue
-
-            if word in chunk_lower:
-                match_score += 1
-
-        # BOOST FOR RELEVANT SECTIONS
-        if any(term in chunk_lower for term in ["resignation", "notice period", "separation", "full and final", "mtech", "mba", "higher education"]):
-            match_score += 5
-
-        # HEADING BOOST
-        if clean_question in chunk_lower:
-            match_score += 5
-
-        # IMPORTANT SECTION BOOST
-        important_keywords = [
-            "holiday",
-            "vpn",
-            "password",
-            "jira",
-            "cafeteria",
-            "menu",
-            "onboarding"
-        ]
-
-        for keyword in important_keywords:
-
-            if keyword in clean_question and keyword in chunk_lower:
-                match_score += 2
-
-        # STORE GOOD MATCHES
-        if match_score >= 2:
-            matched_chunks.append((chunk, match_score))
-
-    # -------------------------------
-    # SORT BEST MATCHES
-    # -------------------------------
-    matched_chunks = sorted(
-        matched_chunks,
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    # -------------------------------
-    # COLLECT RETRIEVAL CANDIDATES
-    # -------------------------------
-    candidate_chunks = []
-    seen_chunks = set()
-
-    def add_candidate(chunk):
-
-        if chunk not in seen_chunks:
-            candidate_chunks.append(chunk)
-            seen_chunks.add(chunk)
-
-    for chunk, score in matched_chunks[:5]:
-        add_candidate(chunk)
-
-    query_tokens = clean_question.split()
-    bm25_scores = bm25.get_scores(query_tokens)
-
-    ranked_indices = sorted(
-        range(len(bm25_scores)),
-        key=lambda i: bm25_scores[i],
-        reverse=True
-    )[:5]
-
-    for index in ranked_indices:
-
-        if bm25_scores[index] > 0:
-            add_candidate(chunks[index])
-
-    docs = vector_store.similarity_search(
-        clean_question,
-        k=5
-    )
-
-    for doc in docs:
-        add_candidate(doc.page_content)
-
-    # -------------------------------
-    # RERANK CANDIDATES BY FULL QUESTION
-    # -------------------------------
-    reranked_chunks = rerank_chunks(
-        original_question,
-        candidate_chunks,
-        top_k=2
-    )
-
-    context = "\n\n".join(
-        [chunk for chunk, score in reranked_chunks]
-    )
-
-    # -------------------------------
-    # LIMIT CONTEXT
-    # -------------------------------
-    context = context[:2000]
-
-    # REMOVE NAVIGATION REFERENCES
-    context = clean_context_for_llm(context)
-
-    # -------------------------------
-    # NO MATCH FOUND
-    # -------------------------------
-    if not context.strip():
-
-        st.subheader("AI Answer")
-
-        st.write(
-            "Please reach out to your HR for this query"
-        )
-
-        st.stop()
-
-    # -------------------------------
-    # PROMPT
-    # -------------------------------
-    prompt = f"""
-You are an AI onboarding assistant.
-
-Rules:
-- Answer ONLY from the provided context.
-- Understand similar wording and user intent.
-- Prioritize headings and matching keywords.
-- Provide relevant answer with key points (use bullet points for multiple items).
-- Keep answers clean, readable, and properly formatted.
-- Put every list item on a NEW LINE.
-- Never merge multiple items into one paragraph.
-- Use bullet points whenever possible.
-- Preserve section headings.
-- Ignore QUICK REFERENCE sections.
-- Ignore RELATED TOPICS sections.
-- Ignore "See Section" references.
-- Do NOT include navigation references in final answer.
-- Give direct answer only.
-- Do not use the word "confidential"; use "restricted" or "internal" instead.
-- Do NOT make up information.
-- If answer is not found, say:
-"I could not find that information in the documents."
-
-Context:
-{context}
-
-Question:
-{original_question}
-
-IMPORTANT RESPONSE FORMAT:
-
-Example:
-
-PUNE HOLIDAYS 2026
-
-Total Holidays: 7
-
-- New Year's Day - 1-Jan-26 - Thursday
-- Pongal / Makar Sankranti - 14-Jan-26 - Wednesday
-- Ram Navmi - 27-Mar-26 - Friday
-- Good Friday - 3-Apr-26 - Friday
-
-Always keep each item on a separate line.
-"""
-
-    # -------------------------------
-    # LLM RESPONSE
-    # -------------------------------
-    with st.spinner("Thinking..."):
-
-        response = llm.invoke(prompt)
-
-    # -------------------------------
-    # OUTPUT
-    # -------------------------------
     st.subheader("Here is your answer")
 
-    st.write(clean_answer_for_user(response.content))
-    
-    # ========== SAVE TO MEMORY ==========
+    if not context.strip():
+        st.write("Please reach out to your HR for this query.")
+        st.stop()
+
+    prompt = build_prompt(context, original_question)
+    with st.spinner("Thinking..."):
+        response = llm.invoke(prompt)
+
+    answer = clean_answer_for_user(response.content)
+    st.write(answer)
+
     st.session_state.last_question = original_question
-    st.session_state.last_answer = response.content
-    # ===================================
+    st.session_state.last_answer = answer
